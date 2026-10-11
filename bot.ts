@@ -50,6 +50,9 @@ interface SessionData {
   cmButtons?: { text: string; url: string }[];
   cmPrivate?: boolean;
   cmEditId?: string;
+  // ── ban ──
+  banIds?: number[];
+  banLabels?: Record<string, string>;
 }
 
 // ─── BOT ────────────────────────────────────────────
@@ -128,7 +131,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -1767,6 +1770,237 @@ bot.callbackQuery("cm_more_apply", async (ctx) => {
   void enqueueCm(() => runSendCampaign(id, { chatId, messageId: mid }));
 });
 
+// ═══════════════════════════════════════════════════
+// 🚫 /ban — block accounts from the Mini App
+// ═══════════════════════════════════════════════════
+const BAN_LIST_MAX = 20;
+
+function banMenuKeyboard() {
+  return new InlineKeyboard()
+    .text("🚫 Ban accounts", "ban_start").row()
+    .text("📋 Banned list", "ban_list").row()
+    .text("❌ Cancel", "cancel");
+}
+
+const BAN_MENU_TEXT =
+  "🚫 Ban\n\nA banned account cannot use the Mini App at all.\nYou can unban from the banned list.";
+
+const BAN_PROMPT =
+  "🚫 Which accounts do you want to ban?\n\n" +
+  "Send the Telegram ID(s) or @username(s), separated by spaces, commas or new lines.\n\n" +
+  "Example:\n138753984 @username";
+
+bot.command("ban", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  await ctx.reply(BAN_MENU_TEXT, { reply_markup: banMenuKeyboard() });
+});
+
+bot.callbackQuery("ban_start", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = { step: "ban_to" };
+  await ctx.editMessageText(BAN_PROMPT, { reply_markup: cancelOnlyKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+
+async function handleBanText(ctx: any, s: SessionData, text: string) {
+  const r = await resolveRecipients(text);
+  if (r.tooMany) {
+    return ctx.reply(`❌ Too many accounts (max ${PRIV_MAX_RECIPIENTS}). Send fewer:`, { reply_markup: cancelOnlyKeyboard() });
+  }
+  let selfSkipped = false;
+  const ids = r.ids.filter((id) => {
+    if (id === ADMIN_ID) { selfSkipped = true; return false; }
+    return true;
+  });
+  const notes = recipientNotes(r) + (selfSkipped ? "\n⚠️ Your own account was skipped — you cannot ban yourself." : "");
+  if (!ids.length) {
+    return ctx.reply("❌ No valid account found." + notes + "\n\nSend again:", { reply_markup: cancelOnlyKeyboard() });
+  }
+  s.banIds = ids;
+  s.banLabels = r.labels;
+  s.step = "ban_confirm";
+  const kb = new InlineKeyboard()
+    .text(`🚫 Ban ${ids.length} account${ids.length === 1 ? "" : "s"}`, "ban_apply").row()
+    .text("✏️ Change accounts", "ban_start").row()
+    .text("❌ Cancel", "cancel");
+  return ctx.reply(`🚫 Ban preview\n\n${recipientsBlock(ids, r.labels)}${notes}\n\nThese accounts will be blocked from the Mini App.`, { reply_markup: kb });
+}
+
+bot.callbackQuery("ban_apply", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  const ids = (s.banIds ?? []).filter((id) => id !== ADMIN_ID);
+  if (s.step !== "ban_confirm" || !ids.length) {
+    ctx.session = {};
+    await ctx.editMessageText("⚠️ Nothing to ban. Start again with /ban.").catch(() => {});
+    return ctx.answerCallbackQuery();
+  }
+  const rows = ids.map((id) => ({ telegram_id: id, banned_by: ADMIN_ID }));
+  const { error } = await supabase.from("banned_users").upsert(rows, { onConflict: "telegram_id" });
+  ctx.session = {};
+  if (error) {
+    await ctx.editMessageText("❌ Error: " + error.message);
+  } else {
+    await ctx.editMessageText(`✅ Banned ${ids.length} account${ids.length === 1 ? "" : "s"}.\n\nUse /ban → Banned list to unban.`);
+  }
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery("ban_list", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = {};
+  const { data, error } = await supabase
+    .from("banned_users")
+    .select("telegram_id, banned_at")
+    .order("banned_at", { ascending: false })
+    .limit(BAN_LIST_MAX);
+  if (error) {
+    await ctx.editMessageText("❌ Error: " + error.message);
+    return ctx.answerCallbackQuery();
+  }
+  const rows = data ?? [];
+  if (!rows.length) {
+    await ctx.editMessageText("📋 No banned accounts.", { reply_markup: new InlineKeyboard().text("⬅️ Back", "ban_menu") });
+    return ctx.answerCallbackQuery();
+  }
+  const { data: users } = await supabase
+    .from("users")
+    .select("telegram_id, username, first_name")
+    .in("telegram_id", rows.map((r: any) => r.telegram_id));
+  const labels: Record<string, string> = {};
+  (users ?? []).forEach((u: any) => { labels[String(u.telegram_id)] = userLabel(u); });
+  const kb = new InlineKeyboard();
+  rows.forEach((r: any) => {
+    const l = labels[String(r.telegram_id)];
+    kb.text(`♻️ Unban ${r.telegram_id}${l ? " — " + l.slice(0, 24) : ""}`, `unban_${r.telegram_id}`).row();
+  });
+  kb.text("⬅️ Back", "ban_menu");
+  await ctx.editMessageText(`📋 Banned accounts (${rows.length}${rows.length === BAN_LIST_MAX ? "+" : ""}) — tap to unban:`, { reply_markup: kb });
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery("ban_menu", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = {};
+  await ctx.editMessageText(BAN_MENU_TEXT, { reply_markup: banMenuKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^unban_(\d+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = Number(ctx.match[1]);
+  const { error } = await supabase.from("banned_users").delete().eq("telegram_id", id);
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await ctx.answerCallbackQuery("♻️ Unbanned " + id);
+  await ctx.editMessageText(`♻️ Account ${id} unbanned.`, { reply_markup: new InlineKeyboard().text("📋 Banned list", "ban_list") });
+});
+
+// ═══════════════════════════════════════════════════
+// 📍 /edit_gps — one global location policy
+// ═══════════════════════════════════════════════════
+type GpsMode = "off" | "optional" | "required";
+const GPS_MODE_LABEL: Record<GpsMode, string> = {
+  off: "Off",
+  optional: "Optional",
+  required: "Required",
+};
+
+async function readGps(): Promise<{ mode: GpsMode; force: boolean; stats: { total: number; withLoc: number; banned: number } | null; error?: string }> {
+  const { data, error } = await supabase
+    .from("gps_settings")
+    .select("mode, force_existing")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) return { mode: "off", force: false, stats: null, error: error.message };
+  const st = await supabase.rpc("gps_stats");
+  const d: any = st.data;
+  const stats = st.error || !d
+    ? null
+    : { total: Number(d.users_total ?? 0), withLoc: Number(d.users_with_location ?? 0), banned: Number(d.banned ?? 0) };
+  const mode = (["off", "optional", "required"].includes((data as any)?.mode) ? (data as any).mode : "off") as GpsMode;
+  return { mode, force: !!(data as any)?.force_existing, stats };
+}
+
+function gpsKeyboard(mode: GpsMode, force: boolean) {
+  const mark = (m: GpsMode) => (mode === m ? "✅ " : "") + GPS_MODE_LABEL[m];
+  return new InlineKeyboard()
+    .text(mark("off"), "gps_mode_off")
+    .text(mark("optional"), "gps_mode_optional")
+    .text(mark("required"), "gps_mode_required").row()
+    .text(`Force existing users: ${force ? "ON ✅" : "OFF"}`, "gps_force_toggle").row()
+    .text("❌ Close", "cancel");
+}
+
+async function gpsMenuText(g: Awaited<ReturnType<typeof readGps>>) {
+  const stats = g.stats
+    ? `\n\n👥 Users with a saved location: ${g.stats.withLoc} / ${g.stats.total}\n🚫 Banned accounts: ${g.stats.banned}`
+    : "";
+  return (
+    "📍 GPS settings\n\n" +
+    `Mode: ${GPS_MODE_LABEL[g.mode]}\n` +
+    `Force existing users: ${g.force ? "ON" : "OFF"}` +
+    stats +
+    "\n\n• Off — location is never requested.\n" +
+    "• Optional — the app asks in the background; users can still enter if they decline.\n" +
+    "• Required — new users must share location to enter. Existing users are not affected unless \"Force existing users\" is ON.\n\n" +
+    "Devices that cannot share location (desktop, web, old Telegram) always enter. Telegram shows its own permission prompt; a user who refuses cannot enter while Required applies to them."
+  );
+}
+
+async function renderGpsMenu(ctx: any, edit: boolean) {
+  const g = await readGps();
+  if (g.error) {
+    const msg = "❌ Error: " + g.error;
+    return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
+  }
+  const text = await gpsMenuText(g);
+  const kb = gpsKeyboard(g.mode, g.force);
+  if (edit) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+bot.command("edit_gps", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  await renderGpsMenu(ctx, false);
+});
+
+bot.callbackQuery(/^gps_mode_(off|optional|required)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const mode = ctx.match[1] as GpsMode;
+  const { error } = await supabase.rpc("set_gps_mode", { p_mode: mode, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderGpsMenu(ctx, true);
+  await ctx.answerCallbackQuery("Mode: " + GPS_MODE_LABEL[mode]);
+});
+
+bot.callbackQuery("gps_force_toggle", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const cur = await readGps();
+  if (cur.error) {
+    await ctx.answerCallbackQuery("Error: " + cur.error.slice(0, 150));
+    return;
+  }
+  const next = !cur.force;
+  const { error } = await supabase.rpc("set_gps_force_existing", { p_force: next, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderGpsMenu(ctx, true);
+  await ctx.answerCallbackQuery("Force existing users: " + (next ? "ON" : "OFF"));
+});
+
 // ─── TEXT HANDLER (all steps) ───────────────────────
 bot.on("message:text", async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -1805,6 +2039,9 @@ bot.on("message:text", async (ctx) => {
     const p = storyPreview(s);
     return ctx.reply(p.text, { reply_markup: p.kb });
   }
+
+  // BAN
+  if (s.step === "ban_to") return handleBanText(ctx, s, text);
 
   // CHAT MESSAGES (the bot writes into users' chats)
   if (s.step === "cm_content") return handleChatTextContent(ctx, s);
