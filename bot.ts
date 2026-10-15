@@ -1902,36 +1902,39 @@ bot.callbackQuery(/^unban_(\d+)$/, async (ctx) => {
 // ═══════════════════════════════════════════════════
 // 📍 /edit_gps — one global location policy
 // ═══════════════════════════════════════════════════
-type GpsMode = "off" | "optional" | "required";
+type GpsMode = "off" | "optional" | "required" | "once";
 const GPS_MODE_LABEL: Record<GpsMode, string> = {
   off: "Off",
   optional: "Optional",
   required: "Required",
+  once: "Once",
 };
 
-async function readGps(): Promise<{ mode: GpsMode; force: boolean; stats: { total: number; withLoc: number; banned: number } | null; error?: string }> {
+async function readGps(): Promise<{ mode: GpsMode; force: boolean; forceOnce: boolean; stats: { total: number; withLoc: number; banned: number } | null; error?: string }> {
   const { data, error } = await supabase
     .from("gps_settings")
-    .select("mode, force_existing")
+    .select("mode, force_existing, force_existing_once")
     .eq("id", 1)
     .maybeSingle();
-  if (error) return { mode: "off", force: false, stats: null, error: error.message };
+  if (error) return { mode: "off", force: false, forceOnce: false, stats: null, error: error.message };
   const st = await supabase.rpc("gps_stats");
   const d: any = st.data;
   const stats = st.error || !d
     ? null
     : { total: Number(d.users_total ?? 0), withLoc: Number(d.users_with_location ?? 0), banned: Number(d.banned ?? 0) };
-  const mode = (["off", "optional", "required"].includes((data as any)?.mode) ? (data as any).mode : "off") as GpsMode;
-  return { mode, force: !!(data as any)?.force_existing, stats };
+  const mode = (["off", "optional", "required", "once"].includes((data as any)?.mode) ? (data as any).mode : "off") as GpsMode;
+  return { mode, force: !!(data as any)?.force_existing, forceOnce: !!(data as any)?.force_existing_once, stats };
 }
 
-function gpsKeyboard(mode: GpsMode, force: boolean) {
+function gpsKeyboard(mode: GpsMode, force: boolean, forceOnce: boolean) {
   const mark = (m: GpsMode) => (mode === m ? "✅ " : "") + GPS_MODE_LABEL[m];
   return new InlineKeyboard()
     .text(mark("off"), "gps_mode_off")
     .text(mark("optional"), "gps_mode_optional")
     .text(mark("required"), "gps_mode_required").row()
+    .text(mark("once"), "gps_mode_once").row()
     .text(`Force existing users: ${force ? "ON ✅" : "OFF"}`, "gps_force_toggle").row()
+    .text(`Force existing users once: ${forceOnce ? "ON ✅" : "OFF"}`, "gps_force_once_toggle").row()
     .text("❌ Close", "cancel");
 }
 
@@ -1942,11 +1945,13 @@ async function gpsMenuText(g: Awaited<ReturnType<typeof readGps>>) {
   return (
     "📍 GPS settings\n\n" +
     `Mode: ${GPS_MODE_LABEL[g.mode]}\n` +
-    `Force existing users: ${g.force ? "ON" : "OFF"}` +
+    `Force existing users: ${g.force ? "ON" : "OFF"} (applies to Required)\n` +
+    `Force existing users once: ${g.forceOnce ? "ON" : "OFF"} (applies to Once)` +
     stats +
     "\n\n• Off — location is never requested.\n" +
     "• Optional — the app asks in the background; users can still enter if they decline.\n" +
-    "• Required — new users must share location to enter. Existing users are not affected unless \"Force existing users\" is ON.\n\n" +
+    "• Required — new users must share location every time they enter. Existing users are not affected unless \"Force existing users\" is ON.\n" +
+    "• Once — a user must share location only until one location is saved; after that the app never asks again. Existing users are asked only in the background unless \"Force existing users once\" is ON.\n\n" +
     "Devices that cannot share location (desktop, web, old Telegram) always enter. Telegram shows its own permission prompt; a user who refuses cannot enter while Required applies to them."
   );
 }
@@ -1958,7 +1963,7 @@ async function renderGpsMenu(ctx: any, edit: boolean) {
     return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
   }
   const text = await gpsMenuText(g);
-  const kb = gpsKeyboard(g.mode, g.force);
+  const kb = gpsKeyboard(g.mode, g.force, g.forceOnce);
   if (edit) {
     await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
   } else {
@@ -1972,7 +1977,7 @@ bot.command("edit_gps", async (ctx) => {
   await renderGpsMenu(ctx, false);
 });
 
-bot.callbackQuery(/^gps_mode_(off|optional|required)$/, async (ctx) => {
+bot.callbackQuery(/^gps_mode_(off|optional|required|once)$/, async (ctx) => {
   if (!await requireAdmin(ctx)) return;
   const mode = ctx.match[1] as GpsMode;
   const { error } = await supabase.rpc("set_gps_mode", { p_mode: mode, p_admin: ADMIN_ID });
@@ -1982,6 +1987,23 @@ bot.callbackQuery(/^gps_mode_(off|optional|required)$/, async (ctx) => {
   }
   await renderGpsMenu(ctx, true);
   await ctx.answerCallbackQuery("Mode: " + GPS_MODE_LABEL[mode]);
+});
+
+bot.callbackQuery("gps_force_once_toggle", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const cur = await readGps();
+  if (cur.error) {
+    await ctx.answerCallbackQuery("Error: " + cur.error.slice(0, 150));
+    return;
+  }
+  const next = !cur.forceOnce;
+  const { error } = await supabase.rpc("set_gps_force_existing_once", { p_force: next, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderGpsMenu(ctx, true);
+  await ctx.answerCallbackQuery("Force existing users once: " + (next ? "ON" : "OFF"));
 });
 
 bot.callbackQuery("gps_force_toggle", async (ctx) => {
